@@ -23,6 +23,41 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
+type (
+	// impModel is used for storing import information
+	impModel struct {
+		path           string
+		localReference string
+		decs           *dst.ImportSpecDecorations
+	}
+
+	impManager struct {
+		groups []*impGroup
+		decs   []string
+	}
+
+	impGroup struct {
+		models []*impModel
+	}
+)
+
+const (
+	GroupStandard int = iota // 0
+	GroupThird
+	GroupSecond
+	GroupLocal
+	GroupCount
+
+	unixNewLine    = "\n"
+	windowsNewLine = "\r\n"
+)
+
+var (
+	unixLineBreak    = []byte{'\n'}
+	windowsLineBreak = []byte{'\r', '\n'}
+	wrongLineBreak   = []byte{'\r', '\r', '\n'}
+)
+
 var (
 	list            bool
 	write           bool
@@ -46,30 +81,6 @@ func init() {
 	flag.StringVar(&localPrefix, "local", "", "put imports beginning with this string after 3rd-party packages; comma-separated list")
 	flag.StringVar(&secondPrefix, "second", "", "put imports beginning with this string after 3rd-party packages; comma-separated list")
 	flag.BoolVar(&transformSingle, "single", false, "transform single import to block format")
-}
-
-// impModel is used for storing import information
-type impModel struct {
-	path           string
-	localReference string
-	decs           *dst.ImportSpecDecorations
-}
-
-const (
-	GroupStandard int = iota // 0
-	GroupThird
-	GroupSecond
-	GroupLocal
-	GroupCount
-)
-
-type impManager struct {
-	groups []*impGroup
-	decs   []string
-}
-
-type impGroup struct {
-	models []*impModel
 }
 
 func (g *impGroup) append(model *impModel) {
@@ -131,6 +142,15 @@ func (m impModel) string() string {
 	}
 
 	return s
+}
+
+// detectLineEnding detects the line ending used in the source.
+// Returns "\r\n" if CRLF is found, otherwise returns "\n".
+func detectLineEnding(src []byte) string {
+	if bytes.Contains(src, windowsLineBreak) {
+		return windowsNewLine
+	}
+	return unixNewLine
 }
 
 // main is the entry point of the program
@@ -304,6 +324,9 @@ func process(src []byte, filePath string) (output []byte, err error) {
 		panic(err)
 	}
 
+	// Detect original line ending
+	eol := detectLineEnding(src)
+
 	// Determine local prefix for this file
 	fileLocalPrefix := localPrefix
 	if fileLocalPrefix == "" && filePath != "" {
@@ -320,17 +343,24 @@ func process(src []byte, filePath string) (output []byte, err error) {
 	}
 
 	convertedImports.alignPkg()
-	convertedToGo := convertedImports.convertImportsToGo()
-	output, err = replaceImports(convertedToGo, node)
+	convertedToGo := convertedImports.convertImportsToGo(eol)
+	output, err = replaceImports(convertedToGo, node, eol)
 	if err != nil {
 		panic(err)
+	}
+
+	// Ensure the entire output uses the original line ending if it was CRLF
+	if eol == windowsNewLine {
+		output = bytes.ReplaceAll(output, unixLineBreak, windowsLineBreak)
+		// bytes.ReplaceAll might have created \r\r\n if some lines already had \r\n
+		output = bytes.ReplaceAll(output, wrongLineBreak, windowsLineBreak)
 	}
 
 	return output, err
 }
 
 // replaceImports replaces existing imports and handles multiple import statements
-func replaceImports(newImports []byte, node *dst.File) ([]byte, error) {
+func replaceImports(newImports []byte, node *dst.File, eol string) ([]byte, error) {
 	var (
 		output []byte
 		err    error
@@ -352,7 +382,7 @@ func replaceImports(newImports []byte, node *dst.File) ([]byte, error) {
 
 	if err == nil {
 		packageName := node.Name.Name
-		output = bytes.Replace(buf.Bytes(), []byte("package "+packageName), append([]byte("package "+packageName+"\n\n"), newImports...), 1)
+		output = bytes.Replace(buf.Bytes(), []byte("package "+packageName), append([]byte("package "+packageName+eol+eol), newImports...), 1)
 	} else {
 		log.Println(err)
 	}
@@ -380,7 +410,7 @@ func (g *impGroup) alignPkg() {
 }
 
 // convertImportsToGo generates output for correct categorized import statements
-func (m *impManager) convertImportsToGo() []byte {
+func (m *impManager) convertImportsToGo(eol string) []byte {
 	prefix := ""
 	if len(m.decs) > 0 {
 		// Trim trailing empty strings from decs to avoid double blank lines
@@ -389,7 +419,7 @@ func (m *impManager) convertImportsToGo() []byte {
 			last--
 		}
 		if last >= 0 {
-			prefix = strings.Join(m.decs[:last+1], "\n") + "\n"
+			prefix = strings.Join(m.decs[:last+1], eol) + eol
 		}
 	}
 
@@ -405,8 +435,8 @@ func (m *impManager) convertImportsToGo() []byte {
 				if imp.decs != nil {
 					// Add Start decorations (comments before)
 					if len(imp.decs.Start) > 0 {
-						start := strings.Join(imp.decs.Start, "\n")
-						s = start + "\nimport " + s
+						start := strings.Join(imp.decs.Start, eol)
+						s = start + eol + "import " + s
 					} else {
 						s = "import " + s
 					}
@@ -428,9 +458,9 @@ func (m *impManager) convertImportsToGo() []byte {
 		if group.countImports() == 0 {
 			continue
 		}
-		output += "\n"
+		output += eol
 		for _, imp := range group.models {
-			output += fmt.Sprintf("\t%v\n", imp.string())
+			output += fmt.Sprintf("\t%v"+eol, imp.string())
 		}
 	}
 
