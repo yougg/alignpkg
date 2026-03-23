@@ -98,9 +98,7 @@ func main() {
 }`)
 	want := `package main
 
-import (
-	"github.com/yougg/alignpkg/package1"
-)
+import "github.com/yougg/alignpkg/package1"
 
 func main() {
 	fmt.Println("Hello!")
@@ -205,9 +203,7 @@ func main() {
 }`)
 	want := `package main
 
-import (
-	"github.com/yougg/alignpkg/package1"
-)
+import "github.com/yougg/alignpkg/package1"
 
 func main() {
 	fmt.Println("Hello!")
@@ -549,5 +545,43 @@ func TestIsLocalPackageWithPrefix(t *testing.T) {
 				t.Errorf("expected %v, got %v", tt.expected, result)
 			}
 		})
+	}
+}
+
+func TestProcessFile_SingleImportBlock(t *testing.T) {
+	oldTransformSingle := transformSingle
+	transformSingle = true
+	defer func() { transformSingle = oldTransformSingle }()
+
+	localPrefix = "github.com/yougg/alignpkg"
+
+	reader := strings.NewReader(
+		`package main
+
+import "github.com/yougg/alignpkg/package1"
+
+
+func main() {
+	fmt.Println("Hello!")
+}`)
+	want := `package main
+
+import (
+	"github.com/yougg/alignpkg/package1"
+)
+
+func main() {
+	fmt.Println("Hello!")
+}
+`
+	output, err := processFile("", reader, os.Stdout)
+	if output == nil {
+		t.Error("expected non-nil output")
+	}
+	if err != nil {
+		t.Errorf("expected no error, got: %v", err)
+	}
+	if string(output) != want {
+		t.Errorf("expected:\n%s\ngot:\n%s", want, string(output))
 	}
 }

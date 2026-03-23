@@ -24,12 +24,13 @@ import (
 )
 
 var (
-	list         bool
-	write        bool
-	updateCache  bool
-	verbose      bool
-	localPrefix  string
-	secondPrefix string
+	list            bool
+	write           bool
+	updateCache     bool
+	verbose         bool
+	localPrefix     string
+	secondPrefix    string
+	transformSingle bool
 
 	standardPackages = make(map[string]struct{})
 	cacheManager     *CacheManager
@@ -44,6 +45,7 @@ func init() {
 	flag.BoolVar(&verbose, "v", false, "verbose logging")
 	flag.StringVar(&localPrefix, "local", "", "put imports beginning with this string after 3rd-party packages; comma-separated list")
 	flag.StringVar(&secondPrefix, "second", "", "put imports beginning with this string after 3rd-party packages; comma-separated list")
+	flag.BoolVar(&transformSingle, "single", false, "transform single import to block format")
 }
 
 // impModel is used for storing import information
@@ -188,7 +190,6 @@ func goImportsSortMain() error {
 // parseFlags parses command line flags and returns the paths to process.
 // It's a var so that custom implementations can replace it in other files.
 var parseFlags = func() []string {
-	flag.BoolVar(&verbose, "v", false, "verbose logging")
 	flag.Parse()
 
 	return flag.Args()
@@ -356,6 +357,14 @@ func (g *impGroup) alignPkg() {
 
 // convertImportsToGo generates output for correct categorized import statements
 func (m *impManager) convertImportsToGo() []byte {
+	if m.countImports() == 1 && !transformSingle {
+		for _, group := range m.groups {
+			if group.countImports() == 1 {
+				return []byte(fmt.Sprintf("import %v", group.models[0].string()))
+			}
+		}
+	}
+
 	output := "import ("
 
 	for _, group := range m.groups {
