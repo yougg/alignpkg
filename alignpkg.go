@@ -52,6 +52,7 @@ func init() {
 type impModel struct {
 	path           string
 	localReference string
+	decs           *dst.ImportSpecDecorations
 }
 
 const (
@@ -64,6 +65,7 @@ const (
 
 type impManager struct {
 	groups []*impGroup
+	decs   []string
 }
 
 type impGroup struct {
@@ -102,11 +104,33 @@ func (m *impManager) SecondPart() *impGroup {
 
 // string is used to get a string representation of an import
 func (m impModel) string() string {
-	if m.localReference == "" {
-		return m.path
+	s := m.path
+	if m.localReference != "" {
+		s = m.localReference + " " + m.path
 	}
 
-	return m.localReference + " " + m.path
+	if m.decs != nil {
+		// Add Start decorations (comments before)
+		if len(m.decs.Start) > 0 {
+			var starts []string
+			for _, start := range m.decs.Start {
+				trimmed := strings.TrimSpace(start)
+				if trimmed != "" {
+					starts = append(starts, trimmed)
+				}
+			}
+			if len(starts) > 0 {
+				startStr := strings.Join(starts, "\n\t")
+				s = startStr + "\n\t" + s
+			}
+		}
+		// Add End decorations (trailing comments)
+		if len(m.decs.End) > 0 {
+			s += " " + strings.Join(m.decs.End, " ")
+		}
+	}
+
+	return s
 }
 
 // main is the entry point of the program
@@ -357,15 +381,48 @@ func (g *impGroup) alignPkg() {
 
 // convertImportsToGo generates output for correct categorized import statements
 func (m *impManager) convertImportsToGo() []byte {
+	prefix := ""
+	if len(m.decs) > 0 {
+		// Trim trailing empty strings from decs to avoid double blank lines
+		last := len(m.decs) - 1
+		for last >= 0 && strings.TrimSpace(m.decs[last]) == "" {
+			last--
+		}
+		if last >= 0 {
+			prefix = strings.Join(m.decs[:last+1], "\n") + "\n"
+		}
+	}
+
 	if m.countImports() == 1 && !transformSingle {
 		for _, group := range m.groups {
 			if group.countImports() == 1 {
-				return []byte(fmt.Sprintf("import %v", group.models[0].string()))
+				imp := group.models[0]
+				s := imp.path
+				if imp.localReference != "" {
+					s = imp.localReference + " " + imp.path
+				}
+
+				if imp.decs != nil {
+					// Add Start decorations (comments before)
+					if len(imp.decs.Start) > 0 {
+						start := strings.Join(imp.decs.Start, "\n")
+						s = start + "\nimport " + s
+					} else {
+						s = "import " + s
+					}
+					// Add End decorations (trailing comments)
+					if len(imp.decs.End) > 0 {
+						s += " " + strings.Join(imp.decs.End, " ")
+					}
+				} else {
+					s = "import " + s
+				}
+				return []byte(prefix + s)
 			}
 		}
 	}
 
-	output := "import ("
+	output := prefix + "import ("
 
 	for _, group := range m.groups {
 		if group.countImports() == 0 {
@@ -400,6 +457,15 @@ func (m *impManager) countImports() int {
 func convertImportsToSlice(node *dst.File, localPrefix string) (*impManager, error) {
 	importCategories := newImpManager()
 
+	// Capture declaration-level decorations from all GenDecl import nodes
+	for _, decl := range node.Decls {
+		if gen, ok := decl.(*dst.GenDecl); ok && gen.Tok == token.IMPORT {
+			if len(gen.Decs.Start) > 0 {
+				importCategories.decs = append(importCategories.decs, gen.Decs.Start...)
+			}
+		}
+	}
+
 	for _, importSpec := range node.Imports {
 		impName := importSpec.Path.Value
 		impNameWithoutQuotes := strings.Trim(impName, "\"")
@@ -410,6 +476,7 @@ func convertImportsToSlice(node *dst.File, localPrefix string) (*impManager, err
 			locImpModel.localReference = locName.Name
 		}
 		locImpModel.path = impName
+		locImpModel.decs = &importSpec.Decs
 
 		if localPrefix != "" && isLocalPackageWithPrefix(impName, localPrefix) {
 			var group = importCategories.Local()

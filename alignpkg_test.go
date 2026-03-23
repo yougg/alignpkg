@@ -50,19 +50,26 @@ func main() {
 }`)
 	want := `package main
 
+// builtin
+// external
+// local
 import (
 	"database/sql/driver"
 	"fmt"
 	"log"
+	/*
+		mijn comment
+	*/
 	"net/http/httptest"
 
 	APA "bitbucket.org/example/package/name"
 	APZ "bitbucket.org/example/package/name"
 	"bitbucket.org/example/package/name2"
-	"bitbucket.org/example/package/name3"
+	"bitbucket.org/example/package/name3" // foopsie
 	"bitbucket.org/example/package/name4"
 
 	"github.com/yougg/alignpkg/package1"
+	// a
 	"github.com/yougg/alignpkg/package2"
 )
 
