@@ -557,7 +557,7 @@ func TestIsLocalPackageWithPrefix(t *testing.T) {
 
 func TestProcessFile_SingleImportBlock(t *testing.T) {
 	oldTransformSingle := transformSingle
-	transformSingle = true
+	transformSingle = "group"
 	defer func() { transformSingle = oldTransformSingle }()
 
 	localPrefix = "github.com/yougg/alignpkg"
@@ -590,5 +590,81 @@ func main() {
 	}
 	if string(output) != want {
 		t.Errorf("expected:\n%s\ngot:\n%s", want, string(output))
+	}
+}
+
+func TestProcessFile_SingleImportKeep(t *testing.T) {
+	oldTransformSingle := transformSingle
+	transformSingle = "keep"
+	defer func() { transformSingle = oldTransformSingle }()
+
+	localPrefix = "github.com/yougg/alignpkg"
+
+	// Case 1: Original is one-line
+	reader1 := strings.NewReader(
+		`package main
+
+import "github.com/yougg/alignpkg/package1"
+
+func main() {}`)
+	want1 := `package main
+
+import "github.com/yougg/alignpkg/package1"
+
+func main() {}
+`
+	output1, _ := processFile("", reader1, os.Stdout)
+	if string(output1) != want1 {
+		t.Errorf("Case 1 (keep oneline) expected:\n%s\ngot:\n%s", want1, string(output1))
+	}
+
+	// Case 2: Original is block
+	reader2 := strings.NewReader(
+		`package main
+
+import (
+	"github.com/yougg/alignpkg/package1"
+)
+
+func main() {}`)
+	want2 := `package main
+
+import (
+	"github.com/yougg/alignpkg/package1"
+)
+
+func main() {}
+`
+	output2, _ := processFile("", reader2, os.Stdout)
+	if string(output2) != want2 {
+		t.Errorf("Case 2 (keep block) expected:\n%s\ngot:\n%s", want2, string(output2))
+	}
+}
+
+func TestProcessFile_SingleImportOnelineForce(t *testing.T) {
+	oldTransformSingle := transformSingle
+	transformSingle = "oneline"
+	defer func() { transformSingle = oldTransformSingle }()
+
+	localPrefix = "github.com/yougg/alignpkg"
+
+	// Force block to oneline
+	reader := strings.NewReader(
+		`package main
+
+import (
+	"github.com/yougg/alignpkg/package1"
+)
+
+func main() {}`)
+	want := `package main
+
+import "github.com/yougg/alignpkg/package1"
+
+func main() {}
+`
+	output, _ := processFile("", reader, os.Stdout)
+	if string(output) != want {
+		t.Errorf("expected oneline force format, got:\n%s", string(output))
 	}
 }

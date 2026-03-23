@@ -40,7 +40,7 @@ alignpkg [flags] [path ...]
 - `-l`, `-list`: Output the results to stdout.
 - `-local "prefix"`: Specify the local package prefix. If omitted, the tool attempts to auto-detect it from `go.mod`.
 - `-second "prefix"`: Specify a secondary prefix (e.g., for internal private libraries).
-- `-single`: Transform single import to block format
+- `-single "mode"`: Set the format for a single import package. Options: `keep` (default, stays as is), `oneline` (force `import "pkg"`), `group` (force `import ("pkg")`).
 - `-v`: Enable verbose logging.
 - `-u`: Update the standard library cache (recommended after changing Go versions).
 

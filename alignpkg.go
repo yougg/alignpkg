@@ -32,8 +32,9 @@ type (
 	}
 
 	impManager struct {
-		groups []*impGroup
-		decs   []string
+		groups  []*impGroup
+		decs    []string
+		isBlock bool
 	}
 
 	impGroup struct {
@@ -65,7 +66,7 @@ var (
 	verbose         bool
 	localPrefix     string
 	secondPrefix    string
-	transformSingle bool
+	transformSingle string
 
 	standardPackages = make(map[string]struct{})
 	cacheManager     *CacheManager
@@ -80,7 +81,7 @@ func init() {
 	flag.BoolVar(&verbose, "v", false, "verbose logging")
 	flag.StringVar(&localPrefix, "local", ``, "put imports beginning with this string after 3rd-party packages; comma-separated list")
 	flag.StringVar(&secondPrefix, "second", ``, "put imports beginning with this string after 3rd-party packages; comma-separated list")
-	flag.BoolVar(&transformSingle, "single", false, "transform single import to block format")
+	flag.StringVar(&transformSingle, "single", "keep", "transform single import format: keep (default), oneline, group")
 }
 
 func (g *impGroup) append(model *impModel) {
@@ -170,6 +171,14 @@ func goImportsSortMain() error {
 		os.Exit(2)
 	}
 	paths := parseFlags()
+
+	// Validate transformSingle flag
+	switch transformSingle {
+	case "keep", "oneline", "group":
+		// valid
+	default:
+		return fmt.Errorf("invalid -single value: %s (must be keep, oneline, or group)", transformSingle)
+	}
 
 	if verbose {
 		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -422,7 +431,19 @@ func (m *impManager) convertImportsToGo(eol string) []byte {
 		}
 	}
 
-	if m.countImports() == 1 && !transformSingle {
+	useOneLine := false
+	if m.countImports() == 1 {
+		switch transformSingle {
+		case "oneline":
+			useOneLine = true
+		case "group":
+			useOneLine = false
+		case "keep":
+			useOneLine = !m.isBlock
+		}
+	}
+
+	if useOneLine {
 		for _, group := range m.groups {
 			if group.countImports() == 1 {
 				imp := group.models[0]
@@ -491,6 +512,9 @@ func convertImportsToSlice(node *dst.File, localPrefix string) (*impManager, err
 		if gen, ok := decl.(*dst.GenDecl); ok && gen.Tok == token.IMPORT {
 			if len(gen.Decs.Start) > 0 {
 				importCategories.decs = append(importCategories.decs, gen.Decs.Start...)
+			}
+			if gen.Lparen {
+				importCategories.isBlock = true
 			}
 		}
 	}
