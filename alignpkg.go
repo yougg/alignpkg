@@ -9,7 +9,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -78,8 +78,8 @@ func init() {
 	flag.BoolVar(&write, "write", false, "write result to (source) file instead of stdout")
 	flag.BoolVar(&updateCache, "u", false, "update the standard package cache for current Go version")
 	flag.BoolVar(&verbose, "v", false, "verbose logging")
-	flag.StringVar(&localPrefix, "local", "", "put imports beginning with this string after 3rd-party packages; comma-separated list")
-	flag.StringVar(&secondPrefix, "second", "", "put imports beginning with this string after 3rd-party packages; comma-separated list")
+	flag.StringVar(&localPrefix, "local", ``, "put imports beginning with this string after 3rd-party packages; comma-separated list")
+	flag.StringVar(&secondPrefix, "second", ``, "put imports beginning with this string after 3rd-party packages; comma-separated list")
 	flag.BoolVar(&transformSingle, "single", false, "transform single import to block format")
 }
 
@@ -116,8 +116,8 @@ func (m *impManager) SecondPart() *impGroup {
 // string is used to get a string representation of an import
 func (m impModel) string() string {
 	s := m.path
-	if m.localReference != "" {
-		s = m.localReference + " " + m.path
+	if m.localReference != `` {
+		s = m.localReference + ` ` + m.path
 	}
 
 	if m.decs != nil {
@@ -126,7 +126,7 @@ func (m impModel) string() string {
 			var starts []string
 			for _, start := range m.decs.Start {
 				trimmed := strings.TrimSpace(start)
-				if trimmed != "" {
+				if trimmed != `` {
 					starts = append(starts, trimmed)
 				}
 			}
@@ -137,7 +137,7 @@ func (m impModel) string() string {
 		}
 		// Add End decorations (trailing comments)
 		if len(m.decs.End) > 0 {
-			s += " " + strings.Join(m.decs.End, " ")
+			s += ` ` + strings.Join(m.decs.End, ` `)
 		}
 	}
 
@@ -157,7 +157,8 @@ func detectLineEnding(src []byte) string {
 func main() {
 	err := goImportsSortMain()
 	if err != nil {
-		log.Fatalln(err)
+		slog.Error("failed", `err`, err)
+		os.Exit(1)
 	}
 }
 
@@ -171,16 +172,16 @@ func goImportsSortMain() error {
 	paths := parseFlags()
 
 	if verbose {
-		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	} else {
-		log.SetOutput(io.Discard)
+		slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	}
 
 	// Initialize cache manager
 	var err error
 	cacheManager, err = newCacheManager()
 	if err != nil {
-		log.Printf("warning: failed to initialize cache manager: %v\n", err)
+		slog.Warn("failed to initialize cache manager", `err`, err)
 	}
 
 	// Handle cache update flag
@@ -191,18 +192,18 @@ func goImportsSortMain() error {
 		if err = cacheManager.update(); err != nil {
 			return fmt.Errorf("failed to update cache: %w", err)
 		}
-		fmt.Printf("Cache updated for %s\n", cacheManager.version)
+		slog.Info("Cache updated", `version`, cacheManager.version)
 		return nil
 	}
 
-	if localPrefix == "" {
-		log.Println("no prefix found, using module name")
+	if localPrefix == `` {
+		slog.Info("no prefix found, using module name")
 
 		moduleName := getModuleName()
-		if moduleName != "" {
+		if moduleName != `` {
 			localPrefix = moduleName
 		} else {
-			log.Println("module name not found. skipping localprefix")
+			slog.Info("module name not found. skipping localprefix")
 		}
 	}
 
@@ -260,7 +261,7 @@ func walkDir(path string) error {
 
 // processFile reads a file and processes the content, then checks if they're equal.
 func processFile(filename string, in io.Reader, out io.Writer) ([]byte, error) {
-	log.Printf("processing %v\n", filename)
+	slog.Debug("processing imported packages", `file`, filename)
 
 	if in == nil {
 		f, err := os.Open(filename)
@@ -295,8 +296,6 @@ func processFile(filename string, in io.Reader, out io.Writer) ([]byte, error) {
 		if !list && !write {
 			return res, nil
 		}
-	} else {
-		log.Println("file has not been changed")
 	}
 
 	return res, err
@@ -306,11 +305,11 @@ func processFile(filename string, in io.Reader, out io.Writer) ([]byte, error) {
 func closeFile(file *os.File) {
 	err := file.Close()
 	if err != nil {
-		log.Println("could not close file")
+		slog.Error("could not close file")
 	}
 }
 
-// process processes the source of a file, categorising the imports
+// process processes the source of a file, categorizing the imports
 // filePath is used to detect the local module path for the file
 func process(src []byte, filePath string) (output []byte, err error) {
 	var (
@@ -319,7 +318,7 @@ func process(src []byte, filePath string) (output []byte, err error) {
 		node             *dst.File
 	)
 
-	node, err = decorator.ParseFile(fileSet, "", src, parser.ParseComments)
+	node, err = decorator.ParseFile(fileSet, ``, src, parser.ParseComments)
 	if err != nil {
 		panic(err)
 	}
@@ -329,7 +328,7 @@ func process(src []byte, filePath string) (output []byte, err error) {
 
 	// Determine local prefix for this file
 	fileLocalPrefix := localPrefix
-	if fileLocalPrefix == "" && filePath != "" {
+	if fileLocalPrefix == `` && filePath != `` {
 		// Auto-detect module path from file location
 		fileLocalPrefix = findModulePath(filePath)
 	}
@@ -384,7 +383,7 @@ func replaceImports(newImports []byte, node *dst.File, eol string) ([]byte, erro
 		packageName := node.Name.Name
 		output = bytes.Replace(buf.Bytes(), []byte("package "+packageName), append([]byte("package "+packageName+eol+eol), newImports...), 1)
 	} else {
-		log.Println(err)
+		slog.Error("replace error", `err`, err)
 	}
 
 	return output, err
@@ -411,11 +410,11 @@ func (g *impGroup) alignPkg() {
 
 // convertImportsToGo generates output for correct categorized import statements
 func (m *impManager) convertImportsToGo(eol string) []byte {
-	prefix := ""
+	prefix := ``
 	if len(m.decs) > 0 {
 		// Trim trailing empty strings from decs to avoid double blank lines
 		last := len(m.decs) - 1
-		for last >= 0 && strings.TrimSpace(m.decs[last]) == "" {
+		for last >= 0 && strings.TrimSpace(m.decs[last]) == `` {
 			last--
 		}
 		if last >= 0 {
@@ -428,8 +427,8 @@ func (m *impManager) convertImportsToGo(eol string) []byte {
 			if group.countImports() == 1 {
 				imp := group.models[0]
 				s := imp.path
-				if imp.localReference != "" {
-					s = imp.localReference + " " + imp.path
+				if imp.localReference != `` {
+					s = imp.localReference + ` ` + imp.path
 				}
 
 				if imp.decs != nil {
@@ -442,7 +441,7 @@ func (m *impManager) convertImportsToGo(eol string) []byte {
 					}
 					// Add End decorations (trailing comments)
 					if len(imp.decs.End) > 0 {
-						s += " " + strings.Join(imp.decs.End, " ")
+						s += ` ` + strings.Join(imp.decs.End, ` `)
 					}
 				} else {
 					s = "import " + s
@@ -498,7 +497,7 @@ func convertImportsToSlice(node *dst.File, localPrefix string) (*impManager, err
 
 	for _, importSpec := range node.Imports {
 		impName := importSpec.Path.Value
-		impNameWithoutQuotes := strings.Trim(impName, "\"")
+		impNameWithoutQuotes := strings.Trim(impName, `"`)
 		locName := importSpec.Name
 
 		var locImpModel impModel
@@ -508,7 +507,7 @@ func convertImportsToSlice(node *dst.File, localPrefix string) (*impManager, err
 		locImpModel.path = impName
 		locImpModel.decs = &importSpec.Decs
 
-		if localPrefix != "" && isLocalPackageWithPrefix(impName, localPrefix) {
+		if localPrefix != `` && isLocalPackageWithPrefix(impName, localPrefix) {
 			var group = importCategories.Local()
 			group.append(&locImpModel)
 		} else if isStandardPackage(impNameWithoutQuotes) {
@@ -527,9 +526,9 @@ func convertImportsToSlice(node *dst.File, localPrefix string) (*impManager, err
 }
 
 func isSecondPackage(impName string) bool {
-	if secondPrefix != "" {
+	if secondPrefix != `` {
 		// name with " or not
-		if strings.HasPrefix(impName, secondPrefix) || strings.HasPrefix(impName, "\""+secondPrefix) {
+		if strings.HasPrefix(impName, secondPrefix) || strings.HasPrefix(impName, `"`+secondPrefix) {
 			return true
 		}
 	}
@@ -538,7 +537,7 @@ func isSecondPackage(impName string) bool {
 
 func isLocalPackage(impName string) bool {
 	// name with " or not
-	if strings.HasPrefix(impName, localPrefix) || strings.HasPrefix(impName, "\""+localPrefix) {
+	if strings.HasPrefix(impName, localPrefix) || strings.HasPrefix(impName, `"`+localPrefix) {
 		return true
 	}
 	return false
@@ -546,11 +545,11 @@ func isLocalPackage(impName string) bool {
 
 // isLocalPackageWithPrefix checks if the import is a local package using the given prefix
 func isLocalPackageWithPrefix(impName string, prefix string) bool {
-	if prefix == "" {
+	if prefix == `` {
 		return false
 	}
 	// name with " or not
-	if strings.HasPrefix(impName, prefix) || strings.HasPrefix(impName, "\""+prefix) {
+	if strings.HasPrefix(impName, prefix) || strings.HasPrefix(impName, `"`+prefix) {
 		return true
 	}
 	return false
@@ -585,7 +584,7 @@ func newCacheManager() (*CacheManager, error) {
 // getCacheFile returns the version-specific cache file path
 func (c *CacheManager) getCacheFile() string {
 	// Sanitize version for filename (replace spaces and special chars)
-	safeVersion := strings.ReplaceAll(c.version, " ", "_")
+	safeVersion := strings.ReplaceAll(c.version, ` `, `_`)
 	return filepath.Join(c.cacheDir, safeVersion+".json")
 }
 
@@ -613,13 +612,13 @@ func (c *CacheManager) read() (*PackageInfo, error) {
 		return nil, err
 	}
 
-	fmt.Printf("load standard package cache from %s\n", cacheFile)
+	slog.Info("load standard package cache", `file`, cacheFile)
 	return &info, nil
 }
 
 // write saves the cache for the current Go version
-func (c *CacheManager) write(packages map[string]struct{}) error {
-	// Ensure cache directory exists
+func (c *CacheManager) write(pkgs map[string]struct{}) error {
+	// Ensure the cache directory exists
 	if err := os.MkdirAll(c.cacheDir, 0755); err != nil {
 		return err
 	}
@@ -629,7 +628,7 @@ func (c *CacheManager) write(packages map[string]struct{}) error {
 		Data:    make(map[string]struct{}),
 		Version: c.version,
 	}
-	for k, v := range packages {
+	for k, v := range pkgs {
 		info.Data[k] = v
 	}
 
@@ -642,7 +641,7 @@ func (c *CacheManager) write(packages map[string]struct{}) error {
 		return err
 	}
 
-	fmt.Printf("write standard package cache to %s\n", cacheFile)
+	slog.Info("write standard package cache", `file`, cacheFile)
 	return nil
 }
 
@@ -653,12 +652,12 @@ func (c *CacheManager) update() error {
 		return err
 	}
 
-	packages := make(map[string]struct{})
+	loadedPkgs := make(map[string]struct{})
 	for _, p := range pkgs {
-		packages[p.PkgPath] = struct{}{}
+		loadedPkgs[p.PkgPath] = struct{}{}
 	}
 
-	return c.write(packages)
+	return c.write(loadedPkgs)
 }
 
 // loadOrFetch loads from cache if available, otherwise fetches and caches
@@ -675,17 +674,17 @@ func (c *CacheManager) loadOrFetch() (map[string]struct{}, error) {
 		return nil, err
 	}
 
-	packages := make(map[string]struct{})
+	loadedPkgs := make(map[string]struct{})
 	for _, p := range pkgs {
-		packages[p.PkgPath] = struct{}{}
+		loadedPkgs[p.PkgPath] = struct{}{}
 	}
 
 	// Write to cache
-	if err = c.write(packages); err != nil {
-		log.Printf("warning: failed to write cache: %v", err)
+	if err = c.write(loadedPkgs); err != nil {
+		slog.Warn("failed to write cache", `err`, err)
 	}
 
-	return packages, nil
+	return loadedPkgs, nil
 }
 
 // loadStandardPackages tries to fetch all golang std packages
@@ -695,7 +694,7 @@ func loadStandardPackages() error {
 		var err error
 		cacheManager, err = newCacheManager()
 		if err != nil {
-			log.Printf("warning: failed to initialize cache manager: %v\n", err)
+			slog.Warn("failed to initialize cache manager", `err`, err)
 		}
 	}
 
@@ -732,14 +731,14 @@ func isStandardPackage(pkg string) bool {
 func getModuleName() string {
 	root, err := os.Getwd()
 	if err != nil {
-		log.Println("error when getting root path: ", err)
-		return ""
+		slog.Error("error when getting root path", `err`, err)
+		return ``
 	}
 
 	goModBytes, err := os.ReadFile(filepath.Join(root, "go.mod"))
 	if err != nil {
-		log.Println("error when reading mod file: ", err)
-		return ""
+		slog.Error("error when reading mod file", `err`, err)
+		return ``
 	}
 
 	modName := modfile.ModulePath(goModBytes)
@@ -754,8 +753,8 @@ func findModulePath(startPath string) string {
 	// Get the absolute path
 	absPath, err := filepath.Abs(startPath)
 	if err != nil {
-		log.Println("error when getting absolute path: ", err)
-		return ""
+		slog.Error("error when getting absolute path", `err`, err)
+		return ``
 	}
 
 	// If it's a file, start from its directory
@@ -772,11 +771,11 @@ func findModulePath(startPath string) string {
 			// Found go.mod, parse it
 			goModBytes, err := os.ReadFile(goModPath)
 			if err != nil {
-				log.Println("error when reading mod file: ", err)
-				return ""
+				slog.Error("error when reading mod file", `err`, err)
+				return ``
 			}
 			modName := modfile.ModulePath(goModBytes)
-			log.Printf("found module %s from %s\n", modName, goModPath)
+			slog.Debug("found module", `name`, modName, `path`, goModPath)
 			return modName
 		}
 
@@ -784,8 +783,8 @@ func findModulePath(startPath string) string {
 		parentPath := filepath.Dir(currentPath)
 		if parentPath == currentPath {
 			// Reached root, no go.mod found
-			log.Println("no go.mod found in directory tree")
-			return ""
+			slog.Debug("no go.mod found in directory tree")
+			return ``
 		}
 		currentPath = parentPath
 	}
