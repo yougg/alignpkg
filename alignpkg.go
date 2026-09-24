@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,11 +11,14 @@ import (
 	"go/token"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
+	"sync"
 
 	"github.com/dave/dst"
 	"github.com/dave/dst/decorator"
@@ -92,7 +96,7 @@ func newImpManager() *impManager {
 	groups := make([]*impGroup, GroupCount)
 	for idx := range groups {
 		groups[idx] = &impGroup{
-			models: []*impModel{},
+			models: make([]*impModel, 0),
 		}
 	}
 	return &impManager{groups: groups}
@@ -335,14 +339,16 @@ func process(src []byte, filePath string) (output []byte, err error) {
 	// Detect original line ending
 	eol := detectLineEnding(src)
 
-	// Determine local prefix for this file
+	// Determine local prefix and Go version for this file
 	fileLocalPrefix := localPrefix
+	targetGoVersion := resolveGoVersion(filePath)
 	if fileLocalPrefix == `` && filePath != `` {
 		// Auto-detect module path from file location
-		fileLocalPrefix = findModulePath(filePath)
+		fileLocalPrefix, _ = findModuleInfo(filePath)
 	}
 
-	convertedImports, err = convertImportsToSlice(node, fileLocalPrefix)
+	stdPkgs := getStandardPackagesForVersion(targetGoVersion)
+	convertedImports, err = convertImportsToSlice(node, fileLocalPrefix, stdPkgs)
 	if err != nil {
 		panic(err)
 	}
@@ -406,15 +412,12 @@ func (m *impManager) alignPkg() {
 
 // alignPkg sorts multiple imports by import name & prefix
 func (g *impGroup) alignPkg() {
-	var imports = g.models
-	for x := 0; x < len(imports); x++ {
-		sort.Slice(imports, func(i, j int) bool {
-			if imports[i].path != imports[j].path {
-				return imports[i].path < imports[j].path
-			}
-			return imports[i].localReference < imports[j].localReference
-		})
-	}
+	slices.SortFunc(g.models, func(a, b *impModel) int {
+		if c := cmp.Compare(a.path, b.path); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.localReference, b.localReference)
+	})
 }
 
 // convertImportsToGo generates output for correct categorized import statements
@@ -472,21 +475,22 @@ func (m *impManager) convertImportsToGo(eol string) []byte {
 		}
 	}
 
-	output := prefix + "import ("
+	var output strings.Builder
+	output.WriteString(prefix + "import (")
 
 	for _, group := range m.groups {
 		if group.countImports() == 0 {
 			continue
 		}
-		output += eol
+		output.WriteString(eol)
 		for _, imp := range group.models {
-			output += fmt.Sprintf("\t%v"+eol, imp.string())
+			output.WriteString(fmt.Sprintf("\t%v"+eol, imp.string()))
 		}
 	}
 
-	output += ")"
+	output.WriteString(")")
 
-	return []byte(output)
+	return []byte(output.String())
 }
 
 func (g *impGroup) countImports() int {
@@ -504,7 +508,8 @@ func (m *impManager) countImports() int {
 
 // convertImportsToSlice parses the file with AST and gets all imports
 // localPrefix is the module prefix to identify local packages
-func convertImportsToSlice(node *dst.File, localPrefix string) (*impManager, error) {
+// stdPkgs is the set of standard packages for the target Go version
+func convertImportsToSlice(node *dst.File, localPrefix string, stdPkgs map[string]struct{}) (*impManager, error) {
 	importCategories := newImpManager()
 
 	// Capture declaration-level decorations from all GenDecl import nodes
@@ -534,7 +539,7 @@ func convertImportsToSlice(node *dst.File, localPrefix string) (*impManager, err
 		if localPrefix != `` && isLocalPackageWithPrefix(impName, localPrefix) {
 			var group = importCategories.Local()
 			group.append(&locImpModel)
-		} else if isStandardPackage(impNameWithoutQuotes) {
+		} else if isPackageInSet(impNameWithoutQuotes, stdPkgs) {
 			var group = importCategories.Standard()
 			group.append(&locImpModel)
 		} else if isSecondPackage(impNameWithoutQuotes) {
@@ -547,6 +552,15 @@ func convertImportsToSlice(node *dst.File, localPrefix string) (*impManager, err
 	}
 
 	return importCategories, nil
+}
+
+// isPackageInSet Check if the package name is in the std library set; if the set is empty, fall back to a global check.
+func isPackageInSet(pkg string, stdPkgs map[string]struct{}) bool {
+	if stdPkgs != nil {
+		_, ok := stdPkgs[pkg]
+		return ok
+	}
+	return isStandardPackage(pkg)
 }
 
 func isSecondPackage(impName string) bool {
@@ -588,6 +602,8 @@ type PackageInfo struct {
 type CacheManager struct {
 	cacheDir string
 	version  string
+	mu       sync.RWMutex
+	memory   map[string]map[string]struct{}
 }
 
 // newCacheManager creates a new CacheManager for the current Go version
@@ -602,14 +618,45 @@ func newCacheManager() (*CacheManager, error) {
 	return &CacheManager{
 		cacheDir: cacheDir,
 		version:  version,
+		memory:   make(map[string]map[string]struct{}),
 	}, nil
 }
 
 // getCacheFile returns the version-specific cache file path
 func (c *CacheManager) getCacheFile() string {
-	// Sanitize version for filename (replace spaces and special chars)
-	safeVersion := strings.ReplaceAll(c.version, ` `, `_`)
+	return c.getCacheFileForVersion(c.version)
+}
+
+// getCacheFileForVersion returns the version-specific cache file path for given version
+func (c *CacheManager) getCacheFileForVersion(version string) string {
+	safeVersion := strings.ReplaceAll(version, ` `, `_`)
 	return filepath.Join(c.cacheDir, safeVersion+".json")
+}
+
+// findCacheFile searches for an existing cache file, exact match first, then major.minor prefix match
+func (c *CacheManager) findCacheFile(version string) string {
+	exactFile := c.getCacheFileForVersion(version)
+	if _, err := os.Stat(exactFile); err == nil {
+		return exactFile
+	}
+
+	majorMinor := extractMajorMinor(version)
+	entries, err := os.ReadDir(c.cacheDir)
+	if err != nil {
+		return ``
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		base := strings.TrimSuffix(entry.Name(), ".json")
+		if base == majorMinor || strings.HasPrefix(base, majorMinor+".") {
+			return filepath.Join(c.cacheDir, entry.Name())
+		}
+	}
+
+	return ``
 }
 
 // getOldCachePath returns the old single-file cache path for migration
@@ -620,10 +667,14 @@ func (c *CacheManager) getOldCachePath() string {
 
 // read loads the cache for the current Go version
 func (c *CacheManager) read() (*PackageInfo, error) {
-	cacheFile := c.getCacheFile()
+	return c.readVersion(c.version)
+}
 
-	if _, err := os.Stat(cacheFile); os.IsNotExist(err) {
-		return nil, err
+// readVersion loads the cache for a specific Go version
+func (c *CacheManager) readVersion(version string) (*PackageInfo, error) {
+	cacheFile := c.findCacheFile(version)
+	if cacheFile == `` {
+		return nil, os.ErrNotExist
 	}
 
 	bs, err := os.ReadFile(cacheFile)
@@ -636,25 +687,27 @@ func (c *CacheManager) read() (*PackageInfo, error) {
 		return nil, err
 	}
 
-	slog.Info("load standard package cache", `file`, cacheFile)
+	slog.Info("load standard package cache", `file`, cacheFile, `version`, version)
 	return &info, nil
 }
 
 // write saves the cache for the current Go version
 func (c *CacheManager) write(pkgs map[string]struct{}) error {
-	// Ensure the cache directory exists
+	return c.writeVersion(c.version, pkgs)
+}
+
+// writeVersion saves the cache for a specific Go version
+func (c *CacheManager) writeVersion(version string, pkgs map[string]struct{}) error {
 	if err := os.MkdirAll(c.cacheDir, 0755); err != nil {
 		return err
 	}
 
-	cacheFile := c.getCacheFile()
+	cacheFile := c.getCacheFileForVersion(version)
 	info := PackageInfo{
 		Data:    make(map[string]struct{}),
-		Version: c.version,
+		Version: version,
 	}
-	for k, v := range pkgs {
-		info.Data[k] = v
-	}
+	maps.Copy(info.Data, pkgs)
 
 	bs, err := json.Marshal(info)
 	if err != nil {
@@ -665,11 +718,11 @@ func (c *CacheManager) write(pkgs map[string]struct{}) error {
 		return err
 	}
 
-	slog.Info("write standard package cache", `file`, cacheFile)
+	slog.Info("write standard package cache", `file`, cacheFile, `version`, version)
 	return nil
 }
 
-// update forces a cache refresh for the current Go version
+// update forces a cache refresh for the host Go version and c.version
 func (c *CacheManager) update() error {
 	pkgs, err := packages.Load(nil, "std")
 	if err != nil {
@@ -681,18 +734,50 @@ func (c *CacheManager) update() error {
 		loadedPkgs[p.PkgPath] = struct{}{}
 	}
 
-	return c.write(loadedPkgs)
+	hostVer := getHostGoVersion()
+	if err = c.writeVersion(hostVer, loadedPkgs); err != nil {
+		return err
+	}
+	if hostVer != c.version {
+		_ = c.writeVersion(c.version, loadedPkgs)
+	}
+	return nil
 }
 
 // loadOrFetch loads from cache if available, otherwise fetches and caches
 func (c *CacheManager) loadOrFetch() (map[string]struct{}, error) {
-	// Try to read from the cache first
-	info, err := c.read()
+	return c.loadOrFetchVersion(c.version)
+}
+
+// loadOrFetchVersion loads from cache if available, otherwise fetches and caches for specific version
+func (c *CacheManager) loadOrFetchVersion(version string) (map[string]struct{}, error) {
+	c.mu.RLock()
+	if c.memory != nil {
+		if pkgs, ok := c.memory[version]; ok {
+			c.mu.RUnlock()
+			return pkgs, nil
+		}
+	}
+	c.mu.RUnlock()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.memory == nil {
+		c.memory = make(map[string]map[string]struct{})
+	}
+	if pkgs, ok := c.memory[version]; ok {
+		return pkgs, nil
+	}
+
+	// Try reading from cache
+	info, err := c.readVersion(version)
 	if err == nil && info != nil {
+		c.memory[version] = info.Data
 		return info.Data, nil
 	}
 
-	// Cache miss or error - fetch fresh data
+	// Cache miss - fetch fresh data from environment
 	pkgs, err := packages.Load(nil, "std")
 	if err != nil {
 		return nil, err
@@ -703,12 +788,24 @@ func (c *CacheManager) loadOrFetch() (map[string]struct{}, error) {
 		loadedPkgs[p.PkgPath] = struct{}{}
 	}
 
-	// Write to cache
-	if err = c.write(loadedPkgs); err != nil {
-		slog.Warn("failed to write cache", `err`, err)
+	if writeErr := c.writeVersion(version, loadedPkgs); writeErr != nil {
+		slog.Warn("failed to write cache", `err`, writeErr)
 	}
 
+	c.memory[version] = loadedPkgs
 	return loadedPkgs, nil
+}
+
+// getStandardPackagesForVersion returns the standard packages map for the specified Go version
+func getStandardPackagesForVersion(version string) map[string]struct{} {
+	if cacheManager != nil {
+		pkgs, err := cacheManager.loadOrFetchVersion(version)
+		if err == nil && len(pkgs) > 0 {
+			return pkgs
+		}
+		slog.Warn("failed to load standard packages for version, fallback to global", `version`, version, `err`, err)
+	}
+	return standardPackages
 }
 
 // loadStandardPackages tries to fetch all golang std packages
@@ -724,13 +821,12 @@ func loadStandardPackages() error {
 
 	// Use CacheManager if available
 	if cacheManager != nil {
-		pkgs, err := cacheManager.loadOrFetch()
+		targetVer := getHostGoVersion()
+		pkgs, err := cacheManager.loadOrFetchVersion(targetVer)
 		if err != nil {
 			return err
 		}
-		for k, v := range pkgs {
-			standardPackages[k] = v
-		}
+		maps.Copy(standardPackages, pkgs)
 		return nil
 	}
 
@@ -770,46 +866,128 @@ func getModuleName() string {
 	return modName
 }
 
-// findModulePath searches for go.mod starting from the given path,
-// traversing up the directory tree until found or reaching the root.
-// Returns the module path from go.mod, or empty string if not found.
-func findModulePath(startPath string) string {
-	// Get the absolute path
+// normalizeGoVersion 规范化 Go 版本号（如 "1.27.1" -> "go1.27.1"）
+func normalizeGoVersion(v string) string {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == `` {
+		return ``
+	}
+	if strings.HasPrefix(trimmed, "go") {
+		return trimmed
+	}
+	return "go" + trimmed
+}
+
+// extractMajorMinor 提取版本的主次版本前缀（如 "go1.27.1" -> "go1.27"）
+func extractMajorMinor(version string) string {
+	v := normalizeGoVersion(version)
+	num := strings.TrimPrefix(v, "go")
+	parts := strings.Split(num, ".")
+	if len(parts) >= 2 {
+		return "go" + parts[0] + "." + parts[1]
+	}
+	return v
+}
+
+var (
+	hostGoVersionOnce   sync.Once
+	cachedHostGoVersion string
+)
+
+// getHostGoVersion 获取宿主环境 Go 版本（带缓存）
+func getHostGoVersion() string {
+	hostGoVersionOnce.Do(func() {
+		cachedHostGoVersion = detectHostGoVersion()
+	})
+	return cachedHostGoVersion
+}
+
+// detectHostGoVersion Detect the version of Go SDK installed in the host environment.
+func detectHostGoVersion() string {
+	// try 'go env GOVERSION' first
+	cmd := exec.Command("go", "env", "GOVERSION")
+	if out, err := cmd.Output(); err == nil {
+		v := strings.TrimSpace(string(out))
+		if v != `` {
+			return normalizeGoVersion(v)
+		}
+	}
+
+	// try downgrade go version
+	cmd = exec.Command("go", "version")
+	if out, err := cmd.Output(); err == nil {
+		fields := strings.Fields(string(out))
+		if len(fields) >= 3 && strings.HasPrefix(fields[2], "go") {
+			return fields[2]
+		}
+	}
+
+	// fallback runtime.Version()
+	return runtime.Version()
+}
+
+// resolveGoVersion The Go version of the target code is parsed according to a three-level priority：
+// 1. The Go version declared in go.mod associated with the target code.
+// 2. Host environment Go SDK version
+// 3. Current tool version at compile time runtime.Version()
+func resolveGoVersion(filePath string) string {
+	if filePath != `` {
+		_, modGoVersion := findModuleInfo(filePath)
+		if modGoVersion != `` {
+			return modGoVersion
+		}
+	}
+	return getHostGoVersion()
+}
+
+// findModuleInfo Searching upwards for go.mod returns the module name and the declared Go version.
+func findModuleInfo(startPath string) (string, string) {
 	absPath, err := filepath.Abs(startPath)
 	if err != nil {
 		slog.Error("error when getting absolute path", `err`, err)
-		return ``
+		return ``, ``
 	}
 
-	// If it's a file, start from its directory
 	info, err := os.Stat(absPath)
 	if err == nil && !info.IsDir() {
 		absPath = filepath.Dir(absPath)
 	}
 
-	// Traverse up the directory tree
 	currentPath := absPath
 	for {
 		goModPath := filepath.Join(currentPath, "go.mod")
 		if _, err = os.Stat(goModPath); err == nil {
-			// Found go.mod, parse it
 			goModBytes, err := os.ReadFile(goModPath)
 			if err != nil {
 				slog.Error("error when reading mod file", `err`, err)
-				return ``
+				return ``, ``
 			}
 			modName := modfile.ModulePath(goModBytes)
 			slog.Debug("found module", `name`, modName, `path`, goModPath)
-			return modName
+
+			var goVersion string
+			f, parseErr := modfile.Parse(goModPath, goModBytes, nil)
+			if parseErr == nil && f.Go != nil && f.Go.Version != `` {
+				goVersion = normalizeGoVersion(f.Go.Version)
+				slog.Debug("found go version in go.mod", `version`, goVersion, `path`, goModPath)
+			}
+
+			return modName, goVersion
 		}
 
-		// Move up one directory
 		parentPath := filepath.Dir(currentPath)
 		if parentPath == currentPath {
-			// Reached root, no go.mod found
 			slog.Debug("no go.mod found in directory tree")
-			return ``
+			return ``, ``
 		}
 		currentPath = parentPath
 	}
+}
+
+// findModulePath searches for go.mod starting from the given path,
+// traversing up the directory tree until found or reaching the root.
+// Returns the module path from go.mod, or empty string if not found.
+func findModulePath(startPath string) string {
+	modName, _ := findModuleInfo(startPath)
+	return modName
 }

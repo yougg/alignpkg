@@ -668,3 +668,165 @@ func main() {}
 		t.Errorf("expected oneline force format, got:\n%s", string(output))
 	}
 }
+
+func TestNormalizeGoVersion(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"1.27.1", "go1.27.1"},
+		{"go1.27.1", "go1.27.1"},
+		{"1.21", "go1.21"},
+		{"  go1.22  ", "go1.22"},
+		{"", ""},
+	}
+
+	for _, tt := range tests {
+		result := normalizeGoVersion(tt.input)
+		if result != tt.expected {
+			t.Errorf("normalizeGoVersion(%q) = %q, want %q", tt.input, result, tt.expected)
+		}
+	}
+}
+
+func TestExtractMajorMinor(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"go1.27.1", "go1.27"},
+		{"go1.27", "go1.27"},
+		{"1.26.3", "go1.26"},
+		{"go2.0.1", "go2.0"},
+	}
+
+	for _, tt := range tests {
+		result := extractMajorMinor(tt.input)
+		if result != tt.expected {
+			t.Errorf("extractMajorMinor(%q) = %q, want %q", tt.input, result, tt.expected)
+		}
+	}
+}
+
+func TestFindModuleInfo(t *testing.T) {
+	tmpDir := t.TempDir()
+	goModContent := `module example.com/versiontest
+
+go 1.27.1
+`
+	goModPath := filepath.Join(tmpDir, "go.mod")
+	if err := os.WriteFile(goModPath, []byte(goModContent), 0644); err != nil {
+		t.Fatalf("failed to write go.mod: %v", err)
+	}
+
+	subDir := filepath.Join(tmpDir, "pkg", "sub")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+
+	modPath, goVer := findModuleInfo(subDir)
+	if modPath != "example.com/versiontest" {
+		t.Errorf("expected module path example.com/versiontest, got: %s", modPath)
+	}
+	if goVer != "go1.27.1" {
+		t.Errorf("expected go version go1.27.1, got: %s", goVer)
+	}
+}
+
+func TestResolveGoVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+	goModContent := `module example.com/verresolve
+
+go 1.25.0
+`
+	testFile := filepath.Join(tmpDir, "main.go")
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte(goModContent), 0644); err != nil {
+		t.Fatalf("failed to write go.mod: %v", err)
+	}
+
+	ver := resolveGoVersion(testFile)
+	if ver != "go1.25.0" {
+		t.Errorf("expected go1.25.0 from go.mod, got: %s", ver)
+	}
+
+	hostVer := resolveGoVersion("")
+	if hostVer == "" {
+		t.Error("expected non-empty host go version")
+	}
+}
+
+func TestCacheManager_FuzzyMatchMajorMinor(t *testing.T) {
+	tmpDir := t.TempDir()
+	cm := &CacheManager{
+		cacheDir: tmpDir,
+		version:  "go1.27",
+		memory:   make(map[string]map[string]struct{}),
+	}
+
+	pkgs := map[string]struct{}{
+		"fmt":  {},
+		"uuid": {},
+	}
+	if err := cm.writeVersion("go1.27.1", pkgs); err != nil {
+		t.Fatalf("failed to write version cache: %v", err)
+	}
+
+	info, err := cm.readVersion("go1.27")
+	if err != nil {
+		t.Fatalf("expected fuzzy match for go1.27, got error: %v", err)
+	}
+	if _, ok := info.Data["uuid"]; !ok {
+		t.Error("expected uuid in fuzzy-matched cache")
+	}
+}
+
+func TestProcess_UUIDAsStandardPackageInGo127(t *testing.T) {
+	oldLocalPrefix := localPrefix
+	localPrefix = ""
+	defer func() { localPrefix = oldLocalPrefix }()
+
+	tmpDir := t.TempDir()
+	goModContent := `module example.com/uuidtest
+
+go 1.27.1
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte(goModContent), 0644); err != nil {
+		t.Fatalf("failed to write go.mod: %v", err)
+	}
+	testFilePath := filepath.Join(tmpDir, "main.go")
+
+	src := []byte(`package main
+
+import (
+	"time"
+	"github.com/gin-gonic/gin"
+	"uuid"
+	"example.com/uuidtest/pkg"
+)
+
+func main() {}
+`)
+
+	want := `package main
+
+import (
+	"time"
+	"uuid"
+
+	"github.com/gin-gonic/gin"
+
+	"example.com/uuidtest/pkg"
+)
+
+func main() {}
+`
+
+	out, err := process(src, testFilePath)
+	if err != nil {
+		t.Fatalf("process returned error: %v", err)
+	}
+
+	if string(out) != want {
+		t.Errorf("expected:\n%s\ngot:\n%s", want, string(out))
+	}
+}
